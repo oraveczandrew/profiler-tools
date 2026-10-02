@@ -1,0 +1,2 @@
+# numpy is only needed by trace/
+numpy
