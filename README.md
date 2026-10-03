@@ -51,6 +51,7 @@ python3 scripts/asdb_top.py --db capture.asdb
 | `asdb_site.py` | break down everything under one call site (`--target` + `--app` markers) |
 | `asdb_chain.py` | show full stacks containing all given frame substrings |
 | `asdb_compare.py` | exact per-class counts across captures (first = baseline; `--watch` list) |
+| `hprof_hist.py` | shallow per-class heap histogram from an ART `.hprof` dump (`--db`, `--top`, `--filter`) |
 | `find_no_jvmfield.py` | static source check: class-level properties without `@JvmField` (`--src <kotlin-src-root>`) |
 
 Common flags: `--db` (required, repeatable for compare), `--workers N`
