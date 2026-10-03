@@ -28,6 +28,8 @@ OUT = os.path.splitext(PATH)[0] + '.parsed.npz'
 with open(PATH, 'rb') as f:
     data = f.read()
 print('file size:', len(data), flush=True)
+if not data:
+    sys.exit('empty trace file (still recording?)')
 
 # --- threads: full-file scan (late-created threads are recorded mid-stream) ---
 # Grammar: `02 <id:u16> <len:u16> <name>` core, optionally followed by a `00 00`
@@ -103,36 +105,47 @@ gap_bytes = sum(e - s for s, e in gaps)
 print('gap regions:', len(gaps), 'gap bytes:', gap_bytes,
       'lost to 10B align:', gap_bytes % 10, flush=True)
 
-# --- parse records ---
-bufs = []
+# --- parse records, gap by gap (no giant join: peak RAM stays ~2x file) ---
+# dtypes are minimal: tid/ma u32, ts u64 (wall clock exceeds u32), act u8.
+tid_parts, ma_parts, ts_parts = [], [], []
+n_records = 0
 for s, e in gaps:
     ln = (e - s) // 10 * 10
-    if ln:
-        bufs.append(data[s:s + ln])
-blob = b''.join(bufs)
-w16 = np.frombuffer(blob, dtype=np.uint16).reshape(-1, 5)
-tid16 = w16[:, 0].astype(np.int64)
-ma = (w16[:, 1].astype(np.int64) | (w16[:, 2].astype(np.int64) << 16))
-ts = (w16[:, 3].astype(np.int64) | (w16[:, 4].astype(np.int64) << 16))
-print('records:', len(w16), flush=True)
+    if not ln:
+        continue
+    w16 = np.frombuffer(data, dtype=np.uint16, count=ln // 2, offset=s).reshape(-1, 5)
+    tid16 = w16[:, 0].astype(np.uint32)
+    ma = w16[:, 1].astype(np.uint32) | (w16[:, 2].astype(np.uint32) << 16)
+    ts = w16[:, 3].astype(np.uint64) | (w16[:, 4].astype(np.uint64) << 16)
+    tid_parts.append(tid16)
+    ma_parts.append(ma)  # narrowed to key/act below after keying decision
+    ts_parts.append(ts)
+    n_records += len(w16)
+    del w16, tid16, ma, ts
+print('records:', n_records, flush=True)
+tid_all = np.concatenate(tid_parts) if tid_parts else np.empty(0, dtype=np.uint32)
+ma_all = np.concatenate(ma_parts) if ma_parts else np.empty(0, dtype=np.uint32)
+ts_all = np.concatenate(ts_parts) if ts_parts else np.empty(0, dtype=np.uint64)
+del tid_parts, ma_parts, ts_parts
 
-dex_shift = ma >> 2
-act = ma & 3
+dex_shift = ma_all >> np.uint32(2)
+act = (ma_all & np.uint32(3)).astype(np.uint8)
 # tid==0 chunks are special records (method/thread/summary markers), not events
-valid_tid = np.isin(tid16, list(threads.keys())) & (tid16 != 0)
-mset = set(methods.keys())
-valid_shift = np.array([d in mset for d in dex_shift])
-valid_mask = np.array([(d & ~3) in mset for d in ma])
+valid_tid = np.isin(tid_all, list(threads.keys())) & (tid_all != 0)
+mkeys = np.array(sorted(methods.keys()), dtype=np.uint32)
+valid_shift = np.isin(dex_shift, mkeys)
+valid_mask = np.isin(ma_all & np.uint32(0xFFFFFFFC), mkeys)
 # Method keys are small sequential indexes (mask low 2 bits); ancient files
 # reportedly used pointer>>2. Pick whichever keys hit the table, warn if low.
 if valid_mask.mean() >= valid_shift.mean():
-    dex, valid_dex = (ma & ~3), valid_mask
+    dex, valid_dex = (ma_all & np.uint32(0xFFFFFFFC)), valid_mask
     print('keying: mask (index|action)', flush=True)
 else:
     dex, valid_dex = dex_shift, valid_shift
     print('keying: shift (pointer>>2|action)', flush=True)
+del ma_all, dex_shift
 print('valid tid frac:', valid_tid.mean(), 'valid dex frac:', valid_dex.mean(), flush=True)
-data_mask = tid16 != 0  # tid==0 chunks are special records, not events
+data_mask = tid_all != 0  # tid==0 chunks are special records, not events
 data_dex_frac = valid_dex[data_mask].mean() if data_mask.any() else 1.0
 print('data records:', int(data_mask.sum()), 'dex hit among data:', data_dex_frac, flush=True)
 if data_dex_frac < 0.9:
@@ -140,6 +153,6 @@ if data_dex_frac < 0.9:
 print('action histogram:', np.bincount(act, minlength=4), flush=True)
 
 np.savez_compressed(OUT,
-                     tid=tid16, dex=dex, act=act, ts=ts,
+                     tid=tid_all, dex=dex, act=act, ts=ts_all,
                      valid=valid_tid & valid_dex)
 print('saved', OUT, flush=True)
