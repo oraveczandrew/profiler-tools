@@ -4,7 +4,7 @@ import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from stackwalk import walk_all
+from stackwalk import load_names_for_trace, mmap_trace, walk_all
 
 import numpy as np
 
@@ -32,20 +32,12 @@ def take_flag(flag):
 NS_MARKERS = take_flag('--ns')
 GROUP_SUBS = take_flag('--group')
 
-with open(PATH, 'rb') as f:
-    data = f.read()
-
-pat = re.compile(rb'\x01..0x([0-9a-f]+)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t[^\n]*\n')
-methods = {}
-for m in pat.finditer(data):
-    dex = int(m.group(1), 16)
-    if dex not in methods:
-        methods[dex] = (
-            m.group(2).decode('utf-8', 'replace') + '#' +
-            m.group(3).decode('utf-8', 'replace') + m.group(4).decode('utf-8', 'replace'))
-# Sparse table keyed by method id (ids are multiples of 4); gaps stay ''.
-N = max(methods) + 1
-names = [methods.get(i, '') for i in range(N)]
+# Method names come from trace_analyze's stats file (no 3.6 GB re-read).
+from stackwalk import load_names_for_trace, mmap_trace, walk_all
+st0names = load_names_for_trace(PATH)
+names = st0names
+del st0names
+N = len(names)
 name_of = {i: n for i, n in enumerate(names)}
 idx_of = {}
 for i, n in enumerate(names):
@@ -70,6 +62,7 @@ def thread_at(buf, off):
 
 
 threads = {}
+data = mmap_trace(PATH)  # zero-copy scan; names already come from stats
 pos = data.find(b'\x02')
 while pos != -1:
     r = thread_at(data, pos)

@@ -6,26 +6,17 @@ import os
 
 import numpy as np
 
+from stackwalk import mmap_trace
+
 TRACES = [a for a in sys.argv[1:] if a.endswith('.trace')]
 if not TRACES:
     sys.exit(f'usage: {os.path.basename(sys.argv[0])} <cpu-art-*.trace> [frame-substring ...]')
 PATH = TRACES[0]
 PARSED_NPZ = os.path.splitext(PATH)[0] + '.parsed.npz'
 
-with open(PATH, 'rb') as f:
-    data = f.read()
-
-pat = re.compile(rb'\x01..0x([0-9a-f]+)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t[^\n]*\n')
-methods = {}
-for m in pat.finditer(data):
-    dex = int(m.group(1), 16)
-    if dex not in methods:
-        methods[dex] = (
-            m.group(2).decode('utf-8', 'replace') + '#' +
-            m.group(3).decode('utf-8', 'replace') + m.group(4).decode('utf-8', 'replace'))
-# Sparse table keyed by method id (ids are multiples of 4); gaps stay ''.
-N = max(methods) + 1
-names = [methods.get(i, '') for i in range(N)]
+from stackwalk import load_names_for_trace
+names = load_names_for_trace(PATH)
+N = len(names)
 
 def thread_at(buf, off):
     if buf[off] != 0x02 or off + 7 > len(buf):
@@ -42,6 +33,7 @@ def thread_at(buf, off):
 
 
 threads = {}
+data = mmap_trace(PATH)  # zero-copy scan; names already come from stats
 pos = data.find(b'\x02')
 while pos != -1:
     r = thread_at(data, pos)

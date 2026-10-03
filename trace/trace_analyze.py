@@ -4,7 +4,7 @@ import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from stackwalk import walk_all
+from stackwalk import mmap_trace, walk_all
 
 import numpy as np
 
@@ -14,8 +14,7 @@ PATH = sys.argv[1]
 PARSED_NPZ = os.path.splitext(PATH)[0] + '.parsed.npz'
 STATS_NPZ = os.path.splitext(PATH)[0] + '.stats.npz'
 
-with open(PATH, 'rb') as f:
-    data = f.read()
+data = mmap_trace(PATH)  # zero-copy; only the method table is scanned here
 
 # method table keyed by method id (multiples of 4); gaps stay ''
 pat = re.compile(rb'\x01..0x([0-9a-f]+)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t[^\n]*\n')

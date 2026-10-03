@@ -25,9 +25,43 @@ walker, which is identical wherever the old code did not crash.)
 #     See the License for the specific language governing permissions and
 #     limitations under the License.
 
+import mmap
 import os
+import re
 
 import numpy as np
+
+
+def load_names_for_trace(path):
+    """Method-id table without re-reading multi-GB files twice.
+
+    Prefers trace_analyze's stats file; falls back to a zero-copy mmap scan.
+    Returns a sparse list (gaps are '') indexed by method id.
+    """
+    stats = os.path.splitext(path)[0] + '.stats.npz'
+    if os.path.exists(stats):
+        st = np.load(stats, allow_pickle=True)
+        return [str(n) for n in st['names']]
+    pat = re.compile(rb'\x01..0x([0-9a-f]+)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t[^\n]*\n')
+    methods = {}
+    with open(path, 'rb') as f:
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
+            for m in pat.finditer(data):
+                dex = int(m.group(1), 16)
+                if dex not in methods:
+                    methods[dex] = (
+                        m.group(2).decode('utf-8', 'replace') + '#' +
+                        m.group(3).decode('utf-8', 'replace') +
+                        m.group(4).decode('utf-8', 'replace'))
+    n = max(methods) + 1
+    return [methods.get(i, '') for i in range(n)]
+
+
+def mmap_trace(path):
+    """Zero-copy read handle for full-file scans (thread records, ...)."""
+    f = open(path, 'rb')
+    return mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+
 
 
 def default_workers():
