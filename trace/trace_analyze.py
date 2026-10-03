@@ -17,16 +17,19 @@ STATS_NPZ = os.path.splitext(PATH)[0] + '.stats.npz'
 with open(PATH, 'rb') as f:
     data = f.read()
 
-# method table in FILE ORDER -> index
-pat = re.compile(rb'\x01..0x[0-9a-f]+\t([^\t]*)\t([^\t]*)\t([^\t]*)\t[^\n]*\n')
-names = []
+# method table keyed by method id (multiples of 4); gaps stay ''
+pat = re.compile(rb'\x01..0x([0-9a-f]+)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t[^\n]*\n')
+methods = {}
 for m in pat.finditer(data):
-    cls = m.group(1).decode('utf-8', 'replace')
-    nm = m.group(2).decode('utf-8', 'replace')
-    sig = m.group(3).decode('utf-8', 'replace')
-    names.append(f'{cls}#{nm}{sig}')
-N = len(names)
-print('methods in file order:', N, flush=True)
+    dex = int(m.group(1), 16)
+    if dex not in methods:
+        cls = m.group(2).decode('utf-8', 'replace')
+        nm = m.group(3).decode('utf-8', 'replace')
+        sig = m.group(4).decode('utf-8', 'replace')
+        methods[dex] = f'{cls}#{nm}{sig}'
+N = max(methods) + 1
+names = [methods.get(i, '') for i in range(N)]
+print('methods in table:', len(methods), flush=True)
 
 z = np.load(PARSED_NPZ)
 tid, idx, act, ts = z['tid'], z['dex'], z['act'], z['ts']

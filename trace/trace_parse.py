@@ -1,11 +1,14 @@
 """Parser for Android Studio ART streaming method traces (cpu-art-*.trace).
 
-Empirically reverse-engineered layout:
-  header: 'SLOW' + misc (32 bytes, offsetToData=0x20)
+Empirically reverse-engineered layout (checked against AOSP
+platform/art/runtime/trace.{h,cc} + tools/stream-trace-converter.py):
+  header: 'SLOW' + misc (32 bytes, offsetToData=0x20); version 0xf2 =
+  streaming single-clock, record size u16 at offset 16 (10 or 14 bytes)
   thread records: 02 <id:u16> <len:u16> <name> 00 00
-  method records: 01 <src:2bytes> '0x<dex>' \\t class \\t name \\t sig \\t file \\n (+pad 00s)
-    - method key = dex index (the 2 src bytes are NOT unique)
-  data records (10 bytes): <tid:u16> <dex<<2|action:u32> <ts_us:u32>
+  method records: 01 <u16 len> '0x<index>' \\t class \\t name \\t sig \\t file \\n (+pad 00s)
+    - method key = small sequential index (multiples of 4), NOT a pointer:
+      data records carry <index|action>, so mask the low 2 bits (NO shift)
+  data records: <tid:u16> <index|action:u32> <ts_us:u32> (+ second ts for dual)
     - action: 0=enter, 1/2=exit; ts = wall microseconds (deltas per thread are exact)
   footer: text key=value pairs + *threads/*methods/*end markers
 Data and method records are interleaved (streaming flushes).
@@ -113,12 +116,27 @@ ma = (w16[:, 1].astype(np.int64) | (w16[:, 2].astype(np.int64) << 16))
 ts = (w16[:, 3].astype(np.int64) | (w16[:, 4].astype(np.int64) << 16))
 print('records:', len(w16), flush=True)
 
-dex = ma >> 2
+dex_shift = ma >> 2
 act = ma & 3
-valid_tid = np.isin(tid16, list(threads.keys()))
+# tid==0 chunks are special records (method/thread/summary markers), not events
+valid_tid = np.isin(tid16, list(threads.keys())) & (tid16 != 0)
 mset = set(methods.keys())
-valid_dex = np.array([d in mset for d in dex])
+valid_shift = np.array([d in mset for d in dex_shift])
+valid_mask = np.array([(d & ~3) in mset for d in ma])
+# Method keys are small sequential indexes (mask low 2 bits); ancient files
+# reportedly used pointer>>2. Pick whichever keys hit the table, warn if low.
+if valid_mask.mean() >= valid_shift.mean():
+    dex, valid_dex = (ma & ~3), valid_mask
+    print('keying: mask (index|action)', flush=True)
+else:
+    dex, valid_dex = dex_shift, valid_shift
+    print('keying: shift (pointer>>2|action)', flush=True)
 print('valid tid frac:', valid_tid.mean(), 'valid dex frac:', valid_dex.mean(), flush=True)
+data_mask = tid16 != 0  # tid==0 chunks are special records, not events
+data_dex_frac = valid_dex[data_mask].mean() if data_mask.any() else 1.0
+print('data records:', int(data_mask.sum()), 'dex hit among data:', data_dex_frac, flush=True)
+if data_dex_frac < 0.9:
+    print('WARNING: low dex hit rate, attributions suspect', flush=True)
 print('action histogram:', np.bincount(act, minlength=4), flush=True)
 
 np.savez_compressed(OUT,

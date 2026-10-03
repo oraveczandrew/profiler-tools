@@ -35,13 +35,17 @@ GROUP_SUBS = take_flag('--group')
 with open(PATH, 'rb') as f:
     data = f.read()
 
-pat = re.compile(rb'\x01..0x[0-9a-f]+\t([^\t]*)\t([^\t]*)\t([^\t]*)\t[^\n]*\n')
-names = []
+pat = re.compile(rb'\x01..0x([0-9a-f]+)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t[^\n]*\n')
+methods = {}
 for m in pat.finditer(data):
-    names.append(
-        m.group(1).decode('utf-8', 'replace') + '#' +
-        m.group(2).decode('utf-8', 'replace') + m.group(3).decode('utf-8', 'replace'))
-N = len(names)
+    dex = int(m.group(1), 16)
+    if dex not in methods:
+        methods[dex] = (
+            m.group(2).decode('utf-8', 'replace') + '#' +
+            m.group(3).decode('utf-8', 'replace') + m.group(4).decode('utf-8', 'replace'))
+# Sparse table keyed by method id (ids are multiples of 4); gaps stay ''.
+N = max(methods) + 1
+names = [methods.get(i, '') for i in range(N)]
 name_of = {i: n for i, n in enumerate(names)}
 idx_of = {}
 for i, n in enumerate(names):
