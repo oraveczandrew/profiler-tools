@@ -25,42 +25,36 @@ walker, which is identical wherever the old code did not crash.)
 #     See the License for the specific language governing permissions and
 #     limitations under the License.
 
-import mmap
 import os
-import re
+import sys
 
 import numpy as np
 
 
-def load_names_for_trace(path):
-    """Method-id table without re-reading multi-GB files twice.
+def require_cached_tables(parsed_npz_path):
+    """Tables precomputed by trace_parse; exits if any is missing.
 
-    Prefers trace_analyze's stats file; falls back to a zero-copy mmap scan.
-    Returns a sparse list (gaps are '') indexed by method id.
+    Returns {'names': [...], 'threads': {tid: name}, 'gaps': [(s, e), ...]}.
+    Downstream scripts never touch the multi-GB .trace; an .npz from an
+    older parser must be regenerated (re-run trace_parse).
     """
-    stats = os.path.splitext(path)[0] + '.stats.npz'
-    if os.path.exists(stats):
-        st = np.load(stats, allow_pickle=True)
-        return [str(n) for n in st['names']]
-    pat = re.compile(rb'\x01..0x([0-9a-f]+)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t[^\n]*\n')
-    methods = {}
-    with open(path, 'rb') as f:
-        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
-            for m in pat.finditer(data):
-                dex = int(m.group(1), 16)
-                if dex not in methods:
-                    methods[dex] = (
-                        m.group(2).decode('utf-8', 'replace') + '#' +
-                        m.group(3).decode('utf-8', 'replace') +
-                        m.group(4).decode('utf-8', 'replace'))
-    n = max(methods) + 1
-    return [methods.get(i, '') for i in range(n)]
-
-
-def mmap_trace(path):
-    """Zero-copy read handle for full-file scans (thread records, ...)."""
-    f = open(path, 'rb')
-    return mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+    missing = []
+    try:
+        z = np.load(parsed_npz_path, allow_pickle=True)
+    except (OSError, ValueError):
+        sys.exit(f'cannot load {parsed_npz_path}; re-run trace_parse.py first')
+    for k in ('names', 'thread_ids', 'thread_names', 'gaps'):
+        if k not in z:
+            missing.append(k)
+    if missing:
+        sys.exit(f'{parsed_npz_path} lacks {missing}; re-run trace_parse.py first')
+    names = [str(n) for n in z['names']]
+    tids = [int(t) for t in z['thread_ids']]
+    tnames = [str(n) for n in z['thread_names']]
+    if len(tids) != len(tnames):
+        sys.exit(f'{parsed_npz_path} has mismatched thread tables; re-run trace_parse.py')
+    gaps = [(int(s), int(e)) for s, e in z['gaps'].tolist()]
+    return {'names': names, 'threads': dict(zip(tids, tnames)), 'gaps': gaps}
 
 
 

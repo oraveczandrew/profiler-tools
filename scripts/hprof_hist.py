@@ -66,6 +66,8 @@ def parse_args(argv=None):
                         help='rows to print (default: 30)')
     parser.add_argument('--filter', default=None,
                         help='only classes containing this substring')
+    parser.add_argument('--workers', type=int, default=0,
+                        help='parallel workers (default: CPU count; 1 = serial)')
     return parser.parse_args(argv)
 
 
@@ -73,105 +75,55 @@ def u32_at(buf, off):
     return struct.unpack_from('>I', buf, off)[0]
 
 
-def run(args):
-    with open(args.db, 'rb') as f:
-        data = f.read()
-    print(f'file size: {len(data)}', flush=True)
-    if data[:18] != b'JAVA PROFILE 1.0.3' or data[18] != 0:
-        sys.exit('not an HPROF file')
-    id_size = u32_at(data, 19)
-    if id_size not in (4, 8):
-        sys.exit(f'unsupported id size: {id_size}')
-    print(f'id size: {id_size}', flush=True)
+def default_workers():
+    try:
+        explicit = int(os.environ.get('WORKERS', '0'))
+        if explicit > 0:
+            return explicit
+    except ValueError:
+        pass
+    return os.cpu_count() or 4
 
-    strings = {}
-    load_classes = {}  # class_id -> name string
-    instance_size = {}  # class_id -> bytes per instance
+
+# Fork-inherited shard inputs (set by the parent before Pool creation; the
+# 127 MB file is read once and workers see it CoW). Job args are just
+# (shard_id, lo, hi) span-index ranges.
+_HDATA = None
+_HSPANS = None
+_HID_SIZE = 4
+
+
+def walk_span_range(data, spans, id_size, lo, hi):
+    """Walk heap spans [lo, hi); returns (counts, total_bytes, skipped).
+
+    Pure function of its arguments (workers call it on inherited globals).
+    counts maps class_id -> [instances, bytes]; primitive arrays key by
+    -etype. skipped counts segments aborted on unknown sub-records.
+    """
     counts = {}
-    total_bytes = 0
+    total = [0]
 
     def bump(cid, nbytes):
-        nonlocal total_bytes
         e = counts.get(cid)
         if e is None:
             counts[cid] = [1, nbytes]
         else:
             e[0] += 1
             e[1] += nbytes
-        total_bytes += nbytes
-
-    off, n = 31, len(data)
-    # Records don't always start right after the fixed header (seen: 17
-    # mystery bytes, likely an OEM header extension). Find the first offset
-    # that chains several valid records instead of assuming one.
-    VALID_TAGS = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-                  0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x1C}
-    found = -1
-    for start in range(off, min(off + 64, n)):
-        o, ok = start, 0
-        while ok < 4:
-            if o + 9 > n:
-                break
-            if data[o] not in VALID_TAGS:
-                break
-            ln = u32_at(data, o + 5)
-            if ln > n:
-                break
-            ok += 1
-            o += 9 + ln
-        if ok >= 4:
-            found = start
-            break
-    if found < 0:
-        sys.exit('no chained records found after header')
-    if found != off:
-        print(f'first record at {found} ({found - off} header extension bytes)', flush=True)
-    off = found
-    n_top = n_heap = 0
-    heap_spans = []
-    while off + 9 <= n:
-        tag = data[off]
-        length = u32_at(data, off + 5)
-        body, bend = off + 9, off + 9 + length
-        if bend > n:
-            print(f'truncated record at {off}, stopping', flush=True)
-            break
-        if tag == 0x01:  # STRING: id + bytes
-            if id_size == 4:
-                sid = u32_at(data, body)
-                strings[sid] = data[body + 4:bend].decode('utf-8', 'replace')
-            else:
-                sid = int.from_bytes(data[body:body + 8], 'big')
-                strings[sid] = data[body + 8:bend].decode('utf-8', 'replace')
-        elif tag == 0x02:  # LOAD_CLASS: serial, class_id, stack, name_id
-            p = body + 4
-            cid = u32_at(data, p) if id_size == 4 else int.from_bytes(data[p:p + 8], 'big')
-            p += id_size
-            p += 4  # stack trace serial
-            nid = u32_at(data, p) if id_size == 4 else int.from_bytes(data[p:p + 8], 'big')
-            load_classes[cid] = nid
-        elif tag in (HEAP_DUMP, HEAP_DUMP_SEGMENT):
-            n_heap += 1
-            heap_spans.append((body, bend))
-        off = bend
+        total[0] += nbytes
 
     def walk_segment(body, bend):
-        """Walk one heap segment; True if fully walked, False on unknown tag
-        (caller reports it and skips the segment). Stepping never depends on
-        class sizes: instance records carry their own u4 length."""
+        """Walk one heap segment; True if fully walked, False on unknown tag."""
         p = body
         while p < bend:
             sub = data[p]
             if sub == CLASS_DUMP:
                 # Stepped for framing only; sizes come from instance records.
                 p += 1
-                cid = u32_at(data, p) if id_size == 4 else int.from_bytes(data[p:p + 8], 'big')
                 p += id_size
                 p += 4 + id_size * 4  # stack, superclass, loader, signer, prot domain
                 p += id_size * 2  # two reserved ids
                 p += 4  # instance size
-                size = u32_at(data, p - 4)
-                instance_size[cid] = size
                 # constant pool
                 ncp = struct.unpack_from('>H', data, p)[0]
                 p += 2
@@ -229,9 +181,153 @@ def run(args):
         return True
 
     skipped = 0
-    for body, bend in heap_spans:
+    for body, bend in spans[lo:hi]:
         if not walk_segment(body, bend):
             skipped += 1
+    return counts, total[0], skipped
+
+
+def _walk_shard(shard_id, lo, hi):
+    """Worker entry: pure function of (shard_id, lo, hi) on fork globals."""
+    assert _HDATA is not None and _HSPANS is not None
+    return walk_span_range(_HDATA, _HSPANS, _HID_SIZE, lo, hi)
+
+
+def _split_spans(spans, n_workers):
+    """Split span indexes into contiguous ranges with ~equal byte counts."""
+    sizes = [e - s for s, e in spans]
+    total = sum(sizes)
+    if n_workers <= 1 or len(spans) <= 1 or total == 0:
+        return [(0, len(spans))]
+    target = max(1, total // n_workers)
+    ranges, lo, acc = [], 0, 0
+    for i, sz in enumerate(sizes):
+        acc += sz
+        if acc >= target and lo < i and len(ranges) < n_workers - 1:
+            ranges.append((lo, i + 1))
+            lo, acc = i + 1, 0
+    ranges.append((lo, len(spans)))
+    return ranges
+
+
+def scan_top_level(data, id_size):
+    """Scan top-level records; returns (strings, load_classes, heap_spans, n_heap).
+
+    Single cheap pass; tables are inherited CoW by forked workers.
+    """
+    strings = {}
+    load_classes = {}  # class_id -> name string id
+    off, n = 31, len(data)
+    # Records don't always start right after the fixed header (seen: 17
+    # mystery bytes, likely an OEM header extension). Find the first offset
+    # that chains several valid records instead of assuming one.
+    VALID_TAGS = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                  0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x1C}
+    found = -1
+    for start in range(off, min(off + 64, n)):
+        o, ok = start, 0
+        while ok < 4:
+            if o + 9 > n:
+                break
+            if data[o] not in VALID_TAGS:
+                break
+            ln = u32_at(data, o + 5)
+            if ln > n:
+                break
+            ok += 1
+            o += 9 + ln
+        if ok >= 4:
+            found = start
+            break
+    if found < 0:
+        sys.exit('no chained records found after header')
+    if found != off:
+        print(f'first record at {found} ({found - off} header extension bytes)', flush=True)
+    off = found
+    n_top = n_heap = 0
+    heap_spans = []
+    while off + 9 <= n:
+        tag = data[off]
+        length = u32_at(data, off + 5)
+        body, bend = off + 9, off + 9 + length
+        if bend > n:
+            print(f'truncated record at {off}, stopping', flush=True)
+            break
+        if tag == 0x01:  # STRING: id + bytes
+            if id_size == 4:
+                sid = u32_at(data, body)
+                strings[sid] = data[body + 4:bend].decode('utf-8', 'replace')
+            else:
+                sid = int.from_bytes(data[body:body + 8], 'big')
+                strings[sid] = data[body + 8:bend].decode('utf-8', 'replace')
+        elif tag == 0x02:  # LOAD_CLASS: serial, class_id, stack, name_id
+            p = body + 4
+            cid = u32_at(data, p) if id_size == 4 else int.from_bytes(data[p:p + 8], 'big')
+            p += id_size
+            p += 4  # stack trace serial
+            nid = u32_at(data, p) if id_size == 4 else int.from_bytes(data[p:p + 8], 'big')
+            load_classes[cid] = nid
+        elif tag in (HEAP_DUMP, HEAP_DUMP_SEGMENT):
+            n_heap += 1
+            heap_spans.append((body, bend))
+        off = bend
+    return strings, load_classes, heap_spans, n_heap
+
+
+def run(args):
+    with open(args.db, 'rb') as f:
+        data = f.read()
+    print(f'file size: {len(data)}', flush=True)
+    if data[:18] != b'JAVA PROFILE 1.0.3' or data[18] != 0:
+        sys.exit('not an HPROF file')
+    id_size = u32_at(data, 19)
+    if id_size not in (4, 8):
+        sys.exit(f'unsupported id size: {id_size}')
+    print(f'id size: {id_size}', flush=True)
+
+    strings = {}
+    load_classes = {}  # class_id -> name string
+    # NOTE: per-class (counts, bytes) are produced by the parallel heap-span
+    # walk below (merged in shard order) into `counts` / `total_bytes`.
+
+    strings, load_classes, heap_spans, n_heap = scan_top_level(data, id_size)
+
+    # --- parallel heap walk, sharded by top-level heap-dump spans ---
+    # strings/load_classes are built above (single cheap pass) and inherited
+    # CoW; workers only return small (counts, bytes) dicts for the parent
+    # to merge in shard order (deterministic = serial-identical).
+    if os.name != 'posix':
+        sys.exit('hprof_hist.py parallel walk needs fork (Unix only)')
+    global _HDATA, _HSPANS, _HID_SIZE
+    _HDATA, _HSPANS, _HID_SIZE = data, heap_spans, id_size
+    import multiprocessing as mp
+    try:
+        mp.set_start_method('fork', force=True)
+    except RuntimeError:
+        pass
+    n_workers = args.workers or default_workers()
+    ranges = _split_spans(heap_spans, n_workers)
+    jobs = [(sid, lo, hi) for sid, (lo, hi) in enumerate(ranges)]
+    if len(jobs) <= 1 or n_workers <= 1:
+        parts = [_walk_shard(sid, lo, hi) for sid, lo, hi in jobs]
+    else:
+        with mp.Pool(min(len(jobs), n_workers)) as pool:
+            parts = pool.starmap(_walk_shard, jobs)
+    counts = {}
+    total_bytes = 0
+    skipped = 0
+    for part_counts, part_total, part_skipped in parts:
+        total_bytes += part_total
+        skipped += part_skipped
+        for cid in sorted(part_counts):
+            cnt, b = part_counts[cid]
+            e = counts.get(cid)
+            if e is None:
+                counts[cid] = [cnt, b]
+            else:
+                e[0] += cnt
+                e[1] += b
+    del parts
     if skipped:
         print(f'{skipped} segments skipped (unknown tags)', flush=True)
     print(f'top-level heap dumps: {n_heap}, heap bytes counted: {total_bytes}', flush=True)

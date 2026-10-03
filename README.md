@@ -51,7 +51,7 @@ python3 scripts/asdb_top.py --db capture.asdb
 | `asdb_site.py` | break down everything under one call site (`--target` + `--app` markers) |
 | `asdb_chain.py` | show full stacks containing all given frame substrings |
 | `asdb_compare.py` | exact per-class counts across captures (first = baseline; `--watch` list) |
-| `hprof_hist.py` | shallow per-class heap histogram from an ART `.hprof` dump (`--db`, `--top`, `--filter`) |
+| `hprof_hist.py` | shallow per-class heap histogram from an ART `.hprof` dump (`--db`, `--top`, `--filter`, `--workers`) |
 | `find_no_jvmfield.py` | static source check: class-level properties without `@JvmField` (`--src <kotlin-src-root>`) |
 
 Common flags: `--db` (required, repeatable for compare), `--workers N`
@@ -77,10 +77,10 @@ binary ART streaming method traces behind *Profiler → CPU → Record*.
 Pipeline: parse once, then analyze the parsed arrays:
 
 ```bash
-python3 trace/trace_parse.py <capture>.trace  # -> <capture>.parsed.npz (next to the trace)
-python3 trace/trace_analyze.py <capture>.trace # inclusive/exclusive stack walk (+ <capture>.stats.npz)
-python3 trace/trace_deep.py <capture>.trace --ns com.example .app. --group .parser. --group .render.
-python3 trace/trace_parents.py <capture>.trace <frame-substring> [...]
+python3 trace/trace_parse.py <capture>.trace --workers 8  # -> <capture>.parsed.npz (next to the trace)
+python3 trace/trace_analyze.py <capture>.trace --workers 8 # inclusive/exclusive stack walk (+ <capture>.stats.npz)
+python3 trace/trace_deep.py <capture>.trace --ns com.example .app. --group .parser. --group .render. --workers 8
+python3 trace/trace_parents.py <capture>.trace <frame-substring> [...] --workers 8
 ```
 
 | Script | Purpose |
@@ -94,6 +94,17 @@ python3 trace/trace_parents.py <capture>.trace <frame-substring> [...]
 All take the `.trace` path as a required argument (usage error otherwise). Requires `numpy`. The binary layout is reverse-engineered
 (see the `trace_parse.py` docstring: `SLOW` header, thread/method/data
 records, `0=enter, 1/2=exit` actions with wall-microsecond timestamps).
+Every `trace/` script (and `hprof_hist.py`) accepts `--workers N`
+(default: CPU count or `$WORKERS`; `1` = serial path through the same
+code); merged tables are identical for any worker count. Unix only
+(`fork`, like the `.asdb` runner below).
+
+`trace_parse.py` precomputes the method-name table, the thread table and
+the data-gap boundaries into the `.parsed.npz` (additive keys alongside
+`tid`/`dex`/`act`/`ts`/`valid`); `trace_analyze.py`, `trace_deep.py` and
+`trace_parents.py` read only the `.npz` and never re-open the multi-GB
+`.trace`. An `.npz` written by an older parser must be regenerated
+(re-run `trace_parse.py`).
 
 ## Parallelism
 
@@ -103,6 +114,12 @@ Each worker opens its own read-only SQLite connection and inherits the decoded
 408 contexts through the fork — only `(lo, hi)` tuples cross the process
 boundary. Measured ~2.4x at 8 workers on a 106 MB capture (serial 43s →
 parallel 18s); beyond that shared-file reads and result merging dominate.
+
+The `trace/` walkers shard per thread (`trace_analyze.py`,
+`trace_deep.py`, `trace_parents.py`) or per file-span range
+(`trace_parse.py` gap-decode + validation), and `hprof_hist.py` shards per
+top-level heap-dump span (strings/`LOAD_CLASS` tables are built once,
+single-threaded, and inherited). Same `--workers` contract as above.
 
 ## App attribution
 

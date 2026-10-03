@@ -1,15 +1,18 @@
-"""Deep cuts: threads, main-thread frames, callers, namespace rollup."""
-import re
+"""Deep cuts: threads, main-thread frames, callers, namespace rollup.
+
+The per-thread section shards by tid via stackwalk.walk_all (forked
+workers); the main-thread and rollup sections are small and stay single.
+"""
 import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from stackwalk import load_names_for_trace, mmap_trace, walk_all
+from stackwalk import walk_all
 
 import numpy as np
 
-if len(sys.argv) < 2:
-    sys.exit(f'usage: {os.path.basename(sys.argv[0])} <cpu-art-*.trace> [--ns MARKER ...] [--group SUB ...]')
+if len(sys.argv) < 2 or sys.argv[1].startswith('--'):
+    sys.exit(f'usage: {os.path.basename(sys.argv[0])} <cpu-art-*.trace> [--ns MARKER ...] [--group SUB ...] [--workers N]')
 PATH = sys.argv[1]
 PARSED_NPZ = os.path.splitext(PATH)[0] + '.parsed.npz'
 STATS_NPZ = os.path.splitext(PATH)[0] + '.stats.npz'
@@ -32,45 +35,41 @@ def take_flag(flag):
 NS_MARKERS = take_flag('--ns')
 GROUP_SUBS = take_flag('--group')
 
-# Method names come from trace_analyze's stats file (no 3.6 GB re-read).
-from stackwalk import load_names_for_trace, mmap_trace, walk_all
-st0names = load_names_for_trace(PATH)
-names = st0names
-del st0names
+
+def take_single(flag):
+    argv = sys.argv[2:]
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == flag and i + 1 < len(argv):
+            try:
+                return int(argv[i + 1])
+            except ValueError:
+                sys.exit(f'{flag} needs an integer')
+        elif a.startswith(flag + '='):
+            try:
+                return int(a.split('=', 1)[1])
+            except ValueError:
+                sys.exit(f'{flag} needs an integer')
+        i += 1
+    return 0
+
+
+WORKERS = take_single('--workers')
+
+# Tables come precomputed from trace_parse's .parsed.npz cache
+# (downstream scripts never re-read the multi-GB .trace).
+from stackwalk import require_cached_tables
+cached = require_cached_tables(PARSED_NPZ)
+names = cached['names']
 N = len(names)
 name_of = {i: n for i, n in enumerate(names)}
 idx_of = {}
 for i, n in enumerate(names):
     idx_of.setdefault(n, i)
 
-# threads: full-file scan (late-created threads are recorded mid-stream)
-import struct
-
-
-def thread_at(buf, off):
-    if buf[off] != 0x02 or off + 7 > len(buf):
-        return None
-    t, nlen = struct.unpack('<HH', buf[off + 1:off + 5])
-    if t > 1000 or nlen < 2 or nlen > 120 or off + 5 + nlen + 2 > len(buf):
-        return None
-    nm = buf[off + 5:off + 5 + nlen]
-    if not all(32 <= b < 127 for b in nm):
-        return None
-    if buf[off + 5 + nlen:off + 5 + nlen + 2] != b'\x00\x00':
-        return None
-    return t, nm.decode('utf-8', 'replace')
-
-
-threads = {}
-data = mmap_trace(PATH)  # zero-copy scan; names already come from stats
-pos = data.find(b'\x02')
-while pos != -1:
-    r = thread_at(data, pos)
-    if r is not None:
-        threads.setdefault(r[0], r[1])
-        pos = data.find(b'\x02', pos + 1)
-    else:
-        pos = data.find(b'\x02', pos + 1)
+# threads: cached table precomputed by trace_parse.
+threads = cached['threads']
 MAIN = next((t for t, n in threads.items() if n == 'main'), None)
 print('main tid:', MAIN, flush=True)
 
@@ -82,7 +81,7 @@ st = np.load(STATS_NPZ)
 incl, excl, calls = st['incl'], st['excl'], st['calls']
 
 print('=== THREADS: events + exclusive busy (ms) ===')
-res = walk_all(tid, idx, act, ts, N)
+res = walk_all(tid, idx, act, ts, N, workers=WORKERS)
 rows = [(busy / 1000, ev, t, threads.get(int(t), '?')) for busy, ev, t in res['rows']]
 for busy_ms, ev, t, nm in sorted(rows, reverse=True)[:15]:
     print(f'{busy_ms:12.1f}ms  ev={ev:<9d} tid={t:<3d} {nm}')

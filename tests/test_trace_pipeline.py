@@ -73,6 +73,39 @@ def run_script(name, *args):
     return proc
 
 
+def run_script_on(trace_path, name, *args):
+    env = dict(os.environ, WORKERS='4')
+    proc = subprocess.run(
+        [sys.executable, os.path.join(TRACE_DIR, name), trace_path, *args],
+        cwd=REPO, env=env, capture_output=True, text=True, timeout=600)
+    return proc
+
+
+TAG2 = 'synth-trace-sharded'
+TRACE_PATH2 = os.path.join(REPO, 'tmp', TAG2 + '.trace')
+
+
+def build_multigap_trace():
+    """Same call tree as build_trace but with method records interleaved
+    between data records, so the data spans ≥2 gap regions (the sharded
+    parser must concatenate them back in file order)."""
+    blob = bytearray()
+    blob += b'SLOW' + b'\x00' * 28
+    blob += thread_rec(1, 'main')
+    blob += thread_rec(2, 'worker')
+    blob += method_rec(0, 'com.ex.A', 'a', '()V', 'A.java')
+    blob += data_rec(1, 0, 0, 0)
+    blob += method_rec(1, 'com.ex.A', 'b', '()V', 'A.java')
+    blob += method_rec(2, 'com.ex.B', 'c', '()V', 'B.java')
+    blob += data_rec(1, 1, 0, 10)
+    blob += data_rec(2, 2, 0, 5)
+    blob += data_rec(1, 1, 1, 40)
+    blob += data_rec(2, 2, 1, 50)
+    blob += data_rec(1, 0, 1, 100)
+    blob += b'*version\nv=1\n*threads\n1 main\n2 worker\n*methods\n*end\n'
+    return bytes(blob)
+
+
 class TracePipelineTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -118,6 +151,153 @@ class TracePipelineTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn('main tid: 1', proc.stdout)
         self.assertIn('tid=1  ', proc.stdout)
+
+    def test_parents(self):
+        self.assertEqual(run_script('trace_parse.py').returncode, 0)
+        self.assertEqual(run_script('trace_analyze.py').returncode, 0)
+        outs = []
+        for w in ('1', '4'):
+            proc = run_script('trace_parents.py', 'com.ex', '--workers', w)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            outs.append(proc.stdout)
+        self.assertIn('matched targets: 3', outs[0])
+        self.assertIn('com.ex.A#b()V', outs[0])
+        norm = [o.replace('workers=1', 'workers=N').replace('workers=4', 'workers=N')
+                for o in outs]
+        self.assertEqual(norm[0], norm[1])
+
+    def test_parents_dict_equivalence(self):
+        # walk_all_parents merge must be identical for any worker count.
+        import importlib.util
+        import numpy as np
+        spec = importlib.util.spec_from_file_location(
+            'trace_parents', os.path.join(TRACE_DIR, 'trace_parents.py'))
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules['trace_parents'] = mod  # needed: mp pickles by reference
+        spec.loader.exec_module(mod)
+        walk_all_parents = mod.walk_all_parents
+        self.assertEqual(run_script('trace_parse.py').returncode, 0)
+        z = np.load(os.path.splitext(TRACE_PATH)[0] + '.parsed.npz')
+        tid, idx, act, ts = z['tid'], z['dex'], z['act'], z['ts']
+        targets = frozenset({0, 1, 2})
+        serial = walk_all_parents(tid, idx, act, ts, targets, workers=1)
+        parallel = walk_all_parents(tid, idx, act, ts, targets, workers=4)
+        self.assertEqual(serial['parent'], parallel['parent'])
+        self.assertEqual(serial['child'], parallel['child'])
+        self.assertEqual(serial['threads'], parallel['threads'])
+
+
+class ShardedParseTest(unittest.TestCase):
+    """Multi-gap fixture: sharded gap-decode must equal serial exactly."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(TRACE_PATH2, 'wb') as f:
+            f.write(build_multigap_trace())
+        cls.addClassCleanup(cls._cleanup)
+
+    @classmethod
+    def _cleanup(cls):
+        for suffix in ('.trace', '.parsed.npz', '.stats.npz'):
+            try:
+                os.remove(os.path.join(REPO, 'tmp', TAG2 + suffix))
+            except OSError:
+                pass
+
+    def _parse_arrays(self, workers):
+        import numpy as np
+        proc = run_script_on(TRACE_PATH2, 'trace_parse.py', '--workers', workers)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc, dict(np.load(os.path.splitext(TRACE_PATH2)[0] + '.parsed.npz',
+                                  allow_pickle=True))
+
+    def test_multiple_gaps(self):
+        proc, _ = self._parse_arrays('1')
+        line = [l for l in proc.stdout.splitlines() if l.startswith('gap regions:')]
+        self.assertEqual(len(line), 1)
+        n_gaps = int(line[0].split()[2])
+        self.assertGreaterEqual(n_gaps, 2)
+
+    def test_sharded_vs_serial_identical(self):
+        import numpy as np
+        _, a = self._parse_arrays('1')
+        _, b = self._parse_arrays('4')
+        self.assertEqual(set(a.keys()), set(b.keys()))
+        for k in a:
+            self.assertTrue((np.asarray(a[k]) == np.asarray(b[k])).all(), k)
+
+
+TAG3 = 'synth-trace-cached'
+TRACE_PATH3 = os.path.join(REPO, 'tmp', TAG3 + '.trace')
+PARSED_PATH3 = os.path.splitext(TRACE_PATH3)[0] + '.parsed.npz'
+
+
+class CachedTablesTest(unittest.TestCase):
+    """trace_parse precomputes names/threads/gaps; downstream scripts reuse
+    them instead of re-reading the multi-GB .trace."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(TRACE_PATH3, 'wb') as f:
+            f.write(build_multigap_trace())
+        cls.addClassCleanup(cls._cleanup)
+
+    @classmethod
+    def _cleanup(cls):
+        for suffix in ('.trace', '.parsed.npz', '.stats.npz'):
+            try:
+                os.remove(os.path.join(REPO, 'tmp', TAG3 + suffix))
+            except OSError:
+                pass
+
+    def _parse(self, workers='4'):
+        if not os.path.exists(TRACE_PATH3):
+            with open(TRACE_PATH3, 'wb') as f:
+                f.write(build_multigap_trace())
+        proc = run_script_on(TRACE_PATH3, 'trace_parse.py', '--workers', workers)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc
+
+    def test_cached_keys_present(self):
+        import numpy as np
+        self._parse()
+        z = dict(np.load(PARSED_PATH3, allow_pickle=True))
+        for k in ('tid', 'dex', 'act', 'ts', 'valid',
+                  'names', 'thread_ids', 'thread_names', 'gaps'):
+            self.assertIn(k, z)
+        names = [str(n) for n in z['names']]
+        self.assertEqual(names, ['com.ex.A#a()V', 'com.ex.A#b()V', 'com.ex.B#c()V'])
+        self.assertEqual(dict(zip([int(t) for t in z['thread_ids']],
+                                  [str(n) for n in z['thread_names']])),
+                         {1: 'main', 2: 'worker'})
+        gaps = [(int(s), int(e)) for s, e in z['gaps'].tolist()]
+        self.assertGreaterEqual(len(gaps), 2)
+        for s, e in gaps:
+            self.assertLess(s, e)
+
+    def test_downstream_without_trace(self):
+        # parse, then DELETE the .trace: analyze/deep/parents must still run
+        # with identical outputs from the cache alone.
+        self._parse()
+        ref = {}
+        for name, args in (('analyze', ('trace_analyze.py',)),
+                           ('deep', ('trace_deep.py',)),
+                           ('parents', ('trace_parents.py', 'com.ex'))):
+            proc = run_script_on(TRACE_PATH3, *args)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            ref[name] = proc.stdout
+        self.assertIn('stack errors: empty=0 mismatch=0 backward=0', ref['analyze'])
+        self.assertIn('main tid: 1', ref['deep'])
+        self.assertIn('matched targets: 3', ref['parents'])
+        os.remove(TRACE_PATH3)
+        for name, args in (('analyze', ('trace_analyze.py',)),
+                           ('deep', ('trace_deep.py',)),
+                           ('parents', ('trace_parents.py', 'com.ex'))):
+            proc = run_script_on(TRACE_PATH3, *args)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            norm = lambda o: o.replace('(cached)', '').replace('workers=4', 'workers=N')
+            self.assertEqual(norm(proc.stdout), norm(ref[name]), name)
 
 
 if __name__ == '__main__':

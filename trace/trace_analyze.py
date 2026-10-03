@@ -1,34 +1,48 @@
-"""Stack-walk analysis of parsed ART streaming trace."""
-import re
+"""Stack-walk analysis of parsed ART streaming trace.
+
+usage:
+    python3 trace/trace_analyze.py <cpu-art-*.trace> [--workers N]
+"""
 import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from stackwalk import mmap_trace, walk_all
+from stackwalk import require_cached_tables, walk_all
 
 import numpy as np
 
-if len(sys.argv) < 2:
-    sys.exit(f'usage: {os.path.basename(sys.argv[0])} <cpu-art-*.trace>')
+if len(sys.argv) < 2 or sys.argv[1].startswith('--'):
+    sys.exit(f'usage: {os.path.basename(sys.argv[0])} <cpu-art-*.trace> [--workers N]')
 PATH = sys.argv[1]
 PARSED_NPZ = os.path.splitext(PATH)[0] + '.parsed.npz'
 STATS_NPZ = os.path.splitext(PATH)[0] + '.stats.npz'
 
-data = mmap_trace(PATH)  # zero-copy; only the method table is scanned here
 
-# method table keyed by method id (multiples of 4); gaps stay ''
-pat = re.compile(rb'\x01..0x([0-9a-f]+)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t[^\n]*\n')
-methods = {}
-for m in pat.finditer(data):
-    dex = int(m.group(1), 16)
-    if dex not in methods:
-        cls = m.group(2).decode('utf-8', 'replace')
-        nm = m.group(3).decode('utf-8', 'replace')
-        sig = m.group(4).decode('utf-8', 'replace')
-        methods[dex] = f'{cls}#{nm}{sig}'
-N = max(methods) + 1
-names = [methods.get(i, '') for i in range(N)]
-print('methods in table:', len(methods), flush=True)
+def take_single(flag):
+    vals = [a.split('=', 1)[1] if a.startswith(flag + '=') else None for a in sys.argv[2:]]
+    for i, a in enumerate(sys.argv[2:]):
+        if a == flag and i + 1 < len(sys.argv[2:]):
+            try:
+                return int(sys.argv[2:][i + 1])
+            except ValueError:
+                sys.exit(f'{flag} needs an integer')
+    for v in vals:
+        if v is not None:
+            try:
+                return int(v)
+            except ValueError:
+                sys.exit(f'{flag} needs an integer')
+    return 0
+
+
+WORKERS = take_single('--workers')
+
+# Method names come precomputed from trace_parse's .parsed.npz cache
+# (downstream scripts never re-read the multi-GB .trace).
+cached = require_cached_tables(PARSED_NPZ)
+names = cached['names']
+N = len(names)
+print('methods in table:', sum(1 for n in names if n), '(cached)', flush=True)
 
 z = np.load(PARSED_NPZ)
 tid, idx, act, ts = z['tid'], z['dex'], z['act'], z['ts']
@@ -37,7 +51,7 @@ ok = (idx >= 0) & (idx < N) & ((act == 0) | (act == 1) | (act == 2))
 print(f'records: {n}, usable: {ok.sum()} ({ok.mean():.3f})', flush=True)
 tid, idx, act, ts = tid[ok], idx[ok], act[ok], ts[ok]
 
-res = walk_all(tid, idx, act, ts, N)
+res = walk_all(tid, idx, act, ts, N, workers=WORKERS)
 incl, excl, calls = res['incl'], res['excl'], res['calls']
 err_empty, err_mismatch, err_back = res['err_empty'], res['err_mismatch'], res['err_back']
 # NOTE: the old per-thread thread_total dict was computed but never printed
