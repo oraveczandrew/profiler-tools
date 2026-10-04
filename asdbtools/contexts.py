@@ -9,6 +9,10 @@ Schema (from the Android Studio profiler plugin protobuf):
     StackFrame{1 method_id, 2 class_name, 3 method_name, 4 file_name, 5 line}
     AllocationStack{1 stack_id, 2 full_stack, 3 encoded_stack}
     ThreadInfo{2 thread_id, 3 thread_name}
+
+    Encoded stacks carry (method_id, line) pairs (fields 1, 2); the captures
+    seen so far are encoded-only, and the methods table carries no lines, so
+    every printed :line comes from encoded field 2 (verified sane).
 """
 #     Copyright 2026 András Oravecz <info@oandras.hu>
 #

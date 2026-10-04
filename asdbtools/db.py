@@ -55,9 +55,13 @@ def chunk_blobs(db_path, kind, lo, hi):
 
 def get_chunks(db_path, kind, n):
     """Split one event kind's rowid range into [lo, hi) spans."""
-    span = rowid_span(open_db(db_path), kind)
-    # NOTE: open_db connection intentionally left to GC; it is read-only and
-    # short-lived here.
+    db = open_db(db_path)
+    try:
+        span = rowid_span(db, kind)
+    finally:
+        db.close()
+    # NOTE: the short-lived read-only connection above is now explicitly
+    # closed (previously left to GC).
     if span is None:
         return []
     lo, hi, _ = span

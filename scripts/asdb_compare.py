@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 
 from asdbtools import chunk_blobs, load_contexts, open_db
 from asdbtools import run as run_parallel
-from asdbtools import fm, sub
+from asdbtools import fm, sub, sv
 
 
 def parse_args(argv=None):
@@ -71,13 +71,14 @@ def _scan_events(blobs, classes, watch_ids):
                 continue
             af = fm(ad[0] if isinstance(ad[0], bytes) else b'')
             total += 1
-            tag = af.get(2, [None])[0]
-            if tag not in watch_ids:
+            tag = sv(af, 2)
+            if not isinstance(tag, int) or tag not in watch_ids:
                 continue
             if not af.get(6):
                 nostack += 1
             count[tag] += 1
-            size[tag] += af.get(3, [0])[0]
+            size_v = sv(af, 3)
+            size[tag] += size_v if isinstance(size_v, int) else 0
     return count, size, total, nostack
 
 
@@ -141,8 +142,10 @@ def run(args):
                 pct = (d / ca * 100) if ca else float('inf')
                 print(f'{name:50} {ca:10} {cb:10} {d:+9} {pct:+7.1f}%   {sb - sa:+12}')
             print('-' * 108)
+            d_total = other["total"] - base["total"]
+            pct_total = (d_total / base["total"] * 100) if base["total"] else float('inf')
             print(f'{"TOTAL allocations":52} {base["total"]:12} {other["total"]:12} '
-                  f'{other["total"] - base["total"]:+10} {(other["total"] - base["total"]) / base["total"] * 100:+7.1f}%')
+                  f'{d_total:+10} {pct_total:+7.1f}%')
 
 
 if __name__ == '__main__':

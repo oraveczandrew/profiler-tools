@@ -157,6 +157,8 @@ def scan_blobs(blobs):
         for batch in fm(pl).get(1, []):
             for ev in fm(batch).get(2, []):
                 ef = fm(ev)
+                if 5 in ef:
+                    continue  # deallocation (no field 4 today, but be explicit)
                 ad = ef.get(4)
                 if not ad:
                     continue
