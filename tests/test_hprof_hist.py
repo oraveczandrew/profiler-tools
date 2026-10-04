@@ -36,11 +36,15 @@ import os
 import struct
 import subprocess
 import sys
+import tempfile
 import unittest
 
-REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..')
+REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'scripts')
-HPROF_PATH = os.path.join(REPO, 'tmp', 'hprof-hist-test.hprof')
+# Hermetic fixture dir (auto-removed on exit); the old tests/../../../tmp
+# layout only worked by accident of the local checkout path.
+_TMP = tempfile.TemporaryDirectory(prefix='hprof-hist-test-')
+HPROF_PATH = os.path.join(_TMP.name, 'hprof-hist-test.hprof')
 
 
 def _load_module():

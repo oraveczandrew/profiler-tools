@@ -23,12 +23,16 @@ import os
 import struct
 import subprocess
 import sys
+import tempfile
 import unittest
 
-REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..')
+REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 TRACE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'trace')
+# Hermetic fixture dir (auto-removed on exit); the old tests/../../../tmp
+# layout only worked by accident of the local checkout path.
+_TMP = tempfile.TemporaryDirectory(prefix='synth-trace-test-')
 TAG = 'synth-trace-test'
-TRACE_PATH = os.path.join(REPO, 'tmp', TAG + '.trace')
+TRACE_PATH = os.path.join(_TMP.name, TAG + '.trace')
 
 
 def thread_rec(tid, name):
@@ -82,7 +86,7 @@ def run_script_on(trace_path, name, *args):
 
 
 TAG2 = 'synth-trace-sharded'
-TRACE_PATH2 = os.path.join(REPO, 'tmp', TAG2 + '.trace')
+TRACE_PATH2 = os.path.join(_TMP.name, TAG2 + '.trace')
 
 
 def build_multigap_trace():
@@ -117,7 +121,7 @@ class TracePipelineTest(unittest.TestCase):
     def _cleanup(cls):
         for suffix in ('.trace', '.parsed.npz', '.stats.npz'):
             try:
-                os.remove(os.path.join(REPO, 'tmp', TAG + suffix))
+                os.remove(os.path.join(_TMP.name, TAG + suffix))
             except OSError:
                 pass
 
@@ -201,7 +205,7 @@ class ShardedParseTest(unittest.TestCase):
     def _cleanup(cls):
         for suffix in ('.trace', '.parsed.npz', '.stats.npz'):
             try:
-                os.remove(os.path.join(REPO, 'tmp', TAG2 + suffix))
+                os.remove(os.path.join(_TMP.name, TAG2 + suffix))
             except OSError:
                 pass
 
@@ -229,7 +233,7 @@ class ShardedParseTest(unittest.TestCase):
 
 
 TAG3 = 'synth-trace-cached'
-TRACE_PATH3 = os.path.join(REPO, 'tmp', TAG3 + '.trace')
+TRACE_PATH3 = os.path.join(_TMP.name, TAG3 + '.trace')
 PARSED_PATH3 = os.path.splitext(TRACE_PATH3)[0] + '.parsed.npz'
 
 
@@ -247,7 +251,7 @@ class CachedTablesTest(unittest.TestCase):
     def _cleanup(cls):
         for suffix in ('.trace', '.parsed.npz', '.stats.npz'):
             try:
-                os.remove(os.path.join(REPO, 'tmp', TAG3 + suffix))
+                os.remove(os.path.join(_TMP.name, TAG3 + suffix))
             except OSError:
                 pass
 
