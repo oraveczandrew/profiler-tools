@@ -52,11 +52,12 @@ python3 scripts/asdb_top.py --db capture.asdb
 | `asdb_chain.py` | show full stacks containing all given frame substrings |
 | `asdb_compare.py` | exact per-class counts across captures (first = baseline; `--watch` list) |
 | `hprof_hist.py` | shallow per-class heap histogram from an ART `.hprof` dump (`--db`, `--top`, `--filter`, `--workers`) |
-| `find_no_jvmfield.py` | static source check: class-level properties without `@JvmField` (`--src <kotlin-src-root>`) |
+| `hprof_referrers.py` | who holds one class alive: per-class referrer aggregation with example chains toward a GC root (`--db`, `--target`, `--chain`, `--workers`) |
+| `find_no_jvmfield.py` | static source check: class-level properties without `@JvmField` (`--src <kotlin-src-root>`, `--show-private`) |
 
 Common flags: `--db` (required, repeatable for compare), `--workers N`
-(default: CPU count; `1` = serial path through the same code), `--output`.
-`--app` (owned, site) and `--watch` (compare) take space-separated values.
+(default: CPU count or `$WORKERS`; `1` = serial path through the same code),
+`--output`. `--app` (owned, site) and `--watch` (compare) take space-separated values.
 
 ```bash
 # single capture, 8 workers
@@ -94,7 +95,7 @@ python3 trace/trace_parents.py <capture>.trace <frame-substring> [...] --workers
 All take the `.trace` path as a required argument (usage error otherwise). Requires `numpy`. The binary layout is reverse-engineered
 (see the `trace_parse.py` docstring: `SLOW` header, thread/method/data
 records, `0=enter, 1/2=exit` actions with wall-microsecond timestamps).
-Every `trace/` script (and `hprof_hist.py`) accepts `--workers N`
+Every `trace/` script (and the `hprof_*.py` scripts) accepts `--workers N`
 (default: CPU count or `$WORKERS`; `1` = serial path through the same
 code); merged tables are identical for any worker count. Unix only
 (`fork`, like the `.asdb` runner below).
@@ -120,6 +121,9 @@ The `trace/` walkers shard per thread (`trace_analyze.py`,
 (`trace_parse.py` gap-decode + validation), and `hprof_hist.py` shards per
 top-level heap-dump span (strings/`LOAD_CLASS` tables are built once,
 single-threaded, and inherited). Same `--workers` contract as above.
+`hprof_referrers.py` reuses the same per-span sharding for its two
+streaming passes (layouts+targets, then edges); each `--chain` hop is one
+extra pass.
 
 ## App attribution
 
@@ -132,5 +136,5 @@ by* your call sites — which is usually where the fix belongs.
 ## Tests
 
 ```bash
-python3 -m pytest tests/   # or: python3 -m unittest discover -s tests
+python3 -m unittest discover -s tests
 ```
