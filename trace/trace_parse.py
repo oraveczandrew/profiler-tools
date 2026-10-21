@@ -2,14 +2,21 @@
 
 Empirically reverse-engineered layout (checked against AOSP
 platform/art/runtime/trace.{h,cc} + tools/stream-trace-converter.py):
-  header: 'SLOW' + misc (32 bytes, offsetToData=0x20); version 0xf2 =
-  streaming single-clock, record size u16 at offset 16 (10 or 14 bytes)
+  header: 'SLOW' + misc (32 bytes, offsetToData=0x20). Streaming version =
+  high nibble 0xf0, low nibble is the ART trace version (2 = single clock,
+  3 = dual clock). Version >= 3 stores record size u16 at offset 16 and
+  defaults to 14 bytes (dual); version 2/legacy uses 10 bytes.
   thread records: 02 <id:u16> <len:u16> <name> 00 00
-  method records: 01 <u16 len> '0x<index>' \\t class \\t name \\t sig \\t file \\n (+pad 00s)
+  method records: 01 <u16 len> '0x<index>'\\t class \\t name \\t sig \\t file \\n (+pad 00s)
+    - a few writers emit index 0 as bare '0' instead of '0x0'
     - method key = small sequential index (multiples of 4), NOT a pointer:
       data records carry <index|action>, so mask the low 2 bits (NO shift)
-  data records: <tid:u16> <index|action:u32> <ts_us:u32> (+ second ts for dual)
-    - action: 0=enter, 1/2=exit; ts = wall microseconds (deltas per thread are exact)
+  data records:
+    10 bytes: <tid:u16> <index|action:u32> <ts_us:u32>
+    14 bytes: <tid:u16> <index|action:u32> <thread_cpu_us:u32> <wall_us:u32>
+    - action: 0=enter, 1/2=exit; wall ts (second field on dual-clock traces)
+      is used, deltas per thread are exact
+  header/footer text: *version ... clock=dual|wall|thread-cpu
   footer: text key=value pairs + *threads/*methods/*end markers
 Data and method records are interleaved (streaming flushes).
 
@@ -59,6 +66,8 @@ _DATA = None
 _GAPS = None
 _THREAD_KEYS = None
 _MKEYS = None
+_REC_SIZE = 10
+_REC14 = np.dtype([('tid', '<u2'), ('ma', '<u4'), ('cpu_us', '<u4'), ('ts_us', '<u4')])
 
 
 def _parse_shard(shard_id, lo, hi):
@@ -66,17 +75,25 @@ def _parse_shard(shard_id, lo, hi):
     assert _DATA is not None and _GAPS is not None
     assert _THREAD_KEYS is not None and _MKEYS is not None
     data, gaps = _DATA, _GAPS
+    rec_size = _REC_SIZE
     tid_parts, ma_parts, ts_parts = [], [], []
     for gi in range(lo, hi):
         s, e = gaps[gi]
-        ln = (e - s) // 10 * 10
-        if not ln:
+        n = (e - s) // rec_size
+        if not n:
             continue
-        w16 = np.frombuffer(data, dtype=np.uint16, count=ln // 2, offset=s).reshape(-1, 5)
-        tid_parts.append(w16[:, 0].astype(np.uint32))
-        ma_parts.append(w16[:, 1].astype(np.uint32) | (w16[:, 2].astype(np.uint32) << 16))
-        ts_parts.append(w16[:, 3].astype(np.uint64) | (w16[:, 4].astype(np.uint64) << 16))
-        del w16
+        if rec_size == 14:
+            rec = np.frombuffer(data, dtype=_REC14, count=n, offset=s)
+            tid_parts.append(rec['tid'].astype(np.uint32))
+            ma_parts.append(rec['ma'].astype(np.uint32))
+            ts_parts.append(rec['ts_us'].astype(np.uint64))
+            del rec
+        else:
+            w16 = np.frombuffer(data, dtype=np.uint16, count=n * 5, offset=s).reshape(-1, 5)
+            tid_parts.append(w16[:, 0].astype(np.uint32))
+            ma_parts.append(w16[:, 1].astype(np.uint32) | (w16[:, 2].astype(np.uint32) << 16))
+            ts_parts.append(w16[:, 3].astype(np.uint64) | (w16[:, 4].astype(np.uint64) << 16))
+            del w16
     if not tid_parts:
         z = np.empty(0, dtype=np.uint32)
         return {'tid': z, 'ma': z.copy(), 'ts': np.empty(0, dtype=np.uint64),
@@ -101,7 +118,7 @@ def _parse_shard(shard_id, lo, hi):
 
 def _split_gaps(gaps, n_workers):
     """Split gap indexes into contiguous ranges with ~equal record counts."""
-    counts = [((e - s) // 10) for s, e in gaps]
+    counts = [((e - s) // _REC_SIZE) for s, e in gaps]
     total = sum(counts)
     if n_workers <= 1 or len(gaps) <= 1 or total == 0:
         return [(0, len(gaps))]
@@ -155,6 +172,22 @@ def main(argv=None):
     if not len(data):
         sys.exit('empty trace file (still recording?)')
 
+    global _REC_SIZE
+    if bytes(data[:4]) != b'SLOW':
+        sys.exit('not a streaming ART trace (missing SLOW magic)')
+    version_raw = int.from_bytes(data[4:6], 'little')
+    if version_raw & 0xF0 == 0xF0:
+        fmt_version = version_raw & 0x0F
+        rec_size = int.from_bytes(data[16:18], 'little') if fmt_version >= 3 else 10
+    else:
+        # Legacy/synthetic traces with a zeroed header: assume v2 single clock.
+        fmt_version = version_raw or 2
+        rec_size = 10
+    if rec_size not in (10, 14):
+        sys.exit(f'unsupported record size {rec_size} (version {fmt_version})')
+    _REC_SIZE = rec_size
+    print(f'format: version {fmt_version}, record size {rec_size}', flush=True)
+
     # --- threads: full-file scan (late-created threads are recorded mid-stream) ---
     # Grammar: `02 <id:u16> <len:u16> <name>` core, optionally followed by a `00 00`
     # separator when another special (thread/method) record follows immediately.
@@ -176,15 +209,17 @@ def main(argv=None):
         print(f'  tid={t:<4d} {threads[t]}', flush=True)
 
     # --- methods (union of framings, keyed by dex idx) ---
-    pat = re.compile(rb'\x01..0x([0-9a-f]+)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\n]*)\n')
+    # Index 0 is written as bare "0" by some writers, everything else as
+    # "0x<hex>"; accept both framings.
+    pat = re.compile(rb'\x01..(0x)?([0-9a-fA-F]+)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\n]*)\n')
     methods = {}
     spans = []
     for m in pat.finditer(data):
-        dex = int(m.group(1), 16)
+        dex = int(m.group(2), 16 if m.group(1) else 10)
         if dex not in methods:
-            cls = m.group(2).decode('utf-8', 'replace')
-            nm = m.group(3).decode('utf-8', 'replace')
-            sig = m.group(4).decode('utf-8', 'replace')
+            cls = m.group(3).decode('utf-8', 'replace')
+            nm = m.group(4).decode('utf-8', 'replace')
+            sig = m.group(5).decode('utf-8', 'replace')
             methods[dex] = f'{cls}#{nm}{sig}'
         spans.append((m.start(), m.end()))
     print('methods:', len(methods), flush=True)
@@ -213,7 +248,7 @@ def main(argv=None):
         prev = max(prev, e)
     gap_bytes = sum(e - s for s, e in gaps)
     print('gap regions:', len(gaps), 'gap bytes:', gap_bytes,
-          'lost to 10B align:', gap_bytes % 10, flush=True)
+          f'lost to {rec_size}B align:', gap_bytes % rec_size, flush=True)
 
     # --- parallel gap-decode + isin validation, sharded by gap spans ---
     # dtypes are minimal: tid/ma u32, ts u64 (wall clock exceeds u32), act u8.

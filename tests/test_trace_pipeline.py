@@ -110,6 +110,48 @@ def build_multigap_trace():
     return bytes(blob)
 
 
+DUAL_TAG = 'synth-trace-dual-clock'
+DUAL_PATH = os.path.join(_TMP.name, DUAL_TAG + '.trace')
+
+
+def header(version_raw, record_size=0):
+    hdr = bytearray(32)
+    hdr[0:4] = b'SLOW'
+    hdr[4:6] = struct.pack('<H', version_raw)
+    hdr[6:8] = struct.pack('<H', 0x20)
+    if record_size:
+        hdr[16:18] = struct.pack('<H', record_size)
+    return bytes(hdr)
+
+
+def method_rec_bare_zero(cls, name, sig, fil):
+    # Some writers emit the index-0 method as "0" instead of "0x0".
+    return b'\x01\x00\x00' + ('0\t%s\t%s\t%s\t%s\n' % (cls, name, sig, fil)).encode()
+
+
+def data_rec_dual(tid, dex, act, cpu_us, wall_us):
+    return struct.pack('<HIII', tid, (dex << 2) | act, cpu_us, wall_us)
+
+
+def build_dual_clock_trace():
+    blob = bytearray()
+    blob += header(0xF3, 14)
+    blob += thread_rec(1, 'main')
+    blob += thread_rec(2, 'worker')
+    blob += method_rec_bare_zero('com.ex.A', 'a', '()V', 'A.java')
+    blob += method_rec(1, 'com.ex.A', 'b', '()V', 'A.java')
+    blob += method_rec(2, 'com.ex.B', 'c', '()V', 'B.java')
+    # Same call tree/timings as build_trace, both clocks advanced.
+    blob += data_rec_dual(1, 0, 0, 0, 0)
+    blob += data_rec_dual(1, 1, 0, 10, 10)
+    blob += data_rec_dual(1, 1, 1, 40, 40)
+    blob += data_rec_dual(1, 0, 1, 100, 100)
+    blob += data_rec_dual(2, 2, 0, 0, 0)
+    blob += data_rec_dual(2, 2, 1, 50, 50)
+    blob += b'*version\n3\nclock=dual\n*threads\n*methods\n*end\n'
+    return bytes(blob)
+
+
 class TracePipelineTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -302,6 +344,42 @@ class CachedTablesTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             norm = lambda o: o.replace('(cached)', '').replace('workers=4', 'workers=N')
             self.assertEqual(norm(proc.stdout), norm(ref[name]), name)
+
+
+class DualClockTraceTest(unittest.TestCase):
+    """Version 0xf3 traces use 14-byte records (thread-cpu + wall clock)."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(DUAL_PATH, 'wb') as f:
+            f.write(build_dual_clock_trace())
+        cls.addClassCleanup(cls._cleanup)
+
+    @classmethod
+    def _cleanup(cls):
+        for suffix in ('.trace', '.parsed.npz', '.stats.npz'):
+            try:
+                os.remove(os.path.join(_TMP.name, DUAL_TAG + suffix))
+            except OSError:
+                pass
+
+    def test_parse(self):
+        proc = run_script_on(DUAL_PATH, 'trace_parse.py')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn('format: version 3, record size 14', proc.stdout)
+        self.assertIn('methods: 3', proc.stdout)
+        self.assertIn('records: 6', proc.stdout)
+        self.assertIn('valid tid frac: 1.0 valid dex frac: 1.0', proc.stdout)
+        self.assertIn('dex hit among data: 1.0', proc.stdout)
+
+    def test_analyze_uses_wall_clock(self):
+        self.assertEqual(run_script_on(DUAL_PATH, 'trace_parse.py').returncode, 0)
+        proc = run_script_on(DUAL_PATH, 'trace_analyze.py')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = proc.stdout
+        self.assertIn('stack errors: empty=0 mismatch=0 backward=0', out)
+        a_line = [l for l in out.splitlines() if l.rstrip().endswith('com.ex.A#a()V')]
+        self.assertTrue(a_line[0].startswith('         100'))
 
 
 if __name__ == '__main__':
