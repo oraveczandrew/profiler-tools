@@ -50,6 +50,8 @@ python3 scripts/asdb_top.py --db capture.asdb
 | `asdb_owned.py` | attribute every allocation to its nearest app-owned frame (`--app` markers) |
 | `asdb_site.py` | break down everything under one call site (`--target` + `--app` markers) |
 | `asdb_chain.py` | show full stacks containing all given frame substrings |
+| `asdb_timeline.py` | time-bucketed view: allocations, distinct stacks, concentration, top sites per bucket, repetitive-phase detection |
+| `asdb_rollup.py` | group allocations by class, package prefix, thread, or nearest app-owned frame |
 | `asdb_compare.py` | exact per-class counts across captures (first = baseline; `--watch` list) |
 | `hprof_hist.py` | shallow per-class heap histogram from an ART `.hprof` dump (`--db`, `--top`, `--filter`, `--workers`) |
 | `hprof_referrers.py` | who holds one class alive: per-class referrer aggregation with example chains toward a GC root (`--db`, `--target`, `--chain`, `--workers`) |
@@ -65,6 +67,30 @@ python3 scripts/asdb_owned.py --db before.asdb --app com/example/app MainActivit
 
 # before/after comparison of an optimization
 python3 scripts/asdb_compare.py --db before.asdb after.asdb --watch Ljava/lang/String; '[B' --workers 8
+```
+
+### Time-resolved analysis
+
+Static top/site reports hide *when* a cost happens. `asdb_timeline.py` buckets
+allocations by the row timestamp and prints, per bucket, allocation count,
+distinct stacks, main-thread share, concentration (allocations per distinct
+stack) and top classes/sites. High concentration means the same small set of
+stacks is being hit repeatedly (a hot loop / long init), which is easy to miss in
+a flat top-10.
+
+```bash
+python3 scripts/asdb_timeline.py --db capture.asdb --bucket-ms 1000 \
+  --needle Conscrypt --needle androidx/startup --workers 8
+```
+
+Use `--needle` to track specific frame substrings per bucket; it renders full
+stacks for every allocation, so it is slower than the default path.
+
+```bash
+# group by package prefix / thread / nearest app-owned frame
+python3 scripts/asdb_rollup.py --db capture.asdb --by package --depth 3
+python3 scripts/asdb_rollup.py --db capture.asdb --by thread
+python3 scripts/asdb_rollup.py --db capture.asdb --by owner --app com/example/app
 ```
 
 **Workload caveat:** two captures are only comparable per unit of work

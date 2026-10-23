@@ -15,19 +15,22 @@
 #     limitations under the License.
 
 from asdbtools.contexts import Contexts, frame_str, load_contexts, stack_str
-from asdbtools.db import chunk_blobs, get_chunks, kind_blobs, open_db
+from asdbtools.db import (chunk_blobs, chunk_dated_blobs, get_chunks, kind_blobs,
+                          min_timestamp, open_db)
 from asdbtools.proto import fm, ss, sub, sv, walk
 from asdbtools.scan import default_workers, run
 
 __all__ = [
     "Contexts",
     "chunk_blobs",
+    "chunk_dated_blobs",
     "default_workers",
     "fm",
     "frame_str",
     "get_chunks",
     "kind_blobs",
     "load_contexts",
+    "min_timestamp",
     "open_db",
     "run",
     "ss",

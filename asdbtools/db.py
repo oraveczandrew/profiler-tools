@@ -53,6 +53,25 @@ def chunk_blobs(db_path, kind, lo, hi):
         db.close()
 
 
+def chunk_dated_blobs(db_path, kind, lo, hi):
+    """Fetch (Timestamp, Data) pairs of one [lo, hi) rowid span (fresh connection)."""
+    db = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+    try:
+        return list(db.execute(
+            'SELECT Timestamp, Data FROM UnifiedEventsTable '
+            'WHERE Kind=? AND rowid >= ? AND rowid < ?',
+            (kind, lo, hi)))
+    finally:
+        db.close()
+
+
+def min_timestamp(db, kind):
+    """Smallest Timestamp for one event kind, or None when there is none."""
+    row = db.execute(
+        'SELECT MIN(Timestamp) FROM UnifiedEventsTable WHERE Kind=?', (kind,)).fetchone()
+    return row[0] if row and row[0] is not None else None
+
+
 def get_chunks(db_path, kind, n):
     """Split one event kind's rowid range into [lo, hi) spans."""
     db = open_db(db_path)
