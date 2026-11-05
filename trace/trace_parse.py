@@ -209,17 +209,30 @@ def main(argv=None):
         print(f'  tid={t:<4d} {threads[t]}', flush=True)
 
     # --- methods (union of framings, keyed by dex idx) ---
-    # Index 0 is written as bare "0" by some writers, everything else as
-    # "0x<hex>"; accept both framings.
-    pat = re.compile(rb'\x01..(0x)?([0-9a-fA-F]+)\t([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\n]*)\n')
+    # Index is normally written as "0x<hex>"; index 0 is written as bare "0"
+    # by some writers. Some writers also omit the 2-byte length before the
+    # index, so the two-byte skip must be optional.
+    pat = re.compile(
+        rb'\x01(?:..)?(0x[0-9a-fA-F]+|[0-9]+)'
+        rb'\t([^\t\n]+)\t([^\t\n]+)\t([^\t\n]+)\t([^\n]*)\n'
+    )
     methods = {}
     spans = []
     for m in pat.finditer(data):
-        dex = int(m.group(2), 16 if m.group(1) else 10)
+        cls_b, name_b, sig_b = m.group(2), m.group(3), m.group(4)
+        # Data records can accidentally look like a method record. Require
+        # printable class/name and a JVM signature to reject those matches.
+        if not all(32 <= b < 127 for b in cls_b):
+            continue
+        if not all(32 <= b < 127 for b in name_b):
+            continue
+        if not sig_b.startswith(b'('):
+            continue
+        dex = int(m.group(1), 0)
         if dex not in methods:
-            cls = m.group(3).decode('utf-8', 'replace')
-            nm = m.group(4).decode('utf-8', 'replace')
-            sig = m.group(5).decode('utf-8', 'replace')
+            cls = cls_b.decode('utf-8', 'replace')
+            nm = name_b.decode('utf-8', 'replace')
+            sig = sig_b.decode('utf-8', 'replace')
             methods[dex] = f'{cls}#{nm}{sig}'
         spans.append((m.start(), m.end()))
     print('methods:', len(methods), flush=True)
